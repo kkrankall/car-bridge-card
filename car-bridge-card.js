@@ -1,16 +1,23 @@
 /*
  * Car Bridge card: a Home Assistant dashboard card for a car that the Car Bridge app sends to Home
  * Assistant. Point it at any of the car's entities (its battery level, say) and it finds the rest on
- * the same device: battery and range, charging, the last trip, tires and where the car is.
+ * the same device: battery and range, charging, the last 7 or 30 days from history, the last charge
+ * and trip, tires and where the car is.
  *
  *   type: custom:car-bridge-card
  *   entity: sensor.my_car_battery_level
  *   name: My car               # optional, defaults to the device's name
- *   show_trip: true            # optional, these three default to true
+ *   show_stats: true           # optional, these five default to true
+ *   show_charge: true
+ *   show_trip: true
  *   show_tires: true
  *   show_chips: true
+ *   stats_period: week         # or month (30 days)
+ *   price: 0.158               # optional, per kWh from the wall, or:
+ *   price_entity: sensor.electricity_price
+ *   charge_efficiency: 0.9     # optional: share of the wall's energy that reaches the battery
  */
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 // Car Bridge's sensor keys by domain: entity IDs are <device>_<key> unless renamed.
 const KEYS = {
@@ -20,6 +27,7 @@ const KEYS = {
     "battery_temperature", "tire_pressure_front_left", "tire_pressure_front_right", "tire_pressure_rear_left",
     "tire_pressure_rear_right", "fuel_level", "fuel_remaining", "energy_charged", "charge_session",
     "last_trip_distance", "last_trip_efficiency", "battery_capacity", "usable_battery_capacity", "last_update",
+    "parked_loss",
   ],
   binary_sensor: ["charging", "plugged_in", "charge_port", "fuel_low", "fuel_door", "driving", "parking_brake"],
 };
@@ -28,9 +36,56 @@ const ALL_KEYS = [...KEYS.sensor, ...KEYS.binary_sensor];
 const ASLEEP_AFTER_MS = 20 * 60_000;
 // Home Assistant's number format settings, as locales.
 const NUMBER_LOCALES = { comma_decimal: "en-US", decimal_comma: "de", space_comma: "fr" };
+// History for the summary: the 30 days shown and the 30 before, to compare. Fetched again after a new
+// trip or charge, and at most every 10 minutes otherwise.
+const HISTORY_DAYS = 61;
+const HISTORY_TTL_MS = 10 * 60_000;
+const DAY_MS = 86_400_000;
+const DEFAULTS = {
+  show_stats: true, show_charge: true, show_trip: true, show_tires: true, show_chips: true,
+  stats_period: "week",
+  // A home (level 2) charger delivers about 90% of what the meter bills to the battery.
+  charge_efficiency: 0.9,
+};
 
 const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+const num = (v) => (v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
+const sum = (values) => values.reduce((total, v) => total + (v ?? 0), 0);
+const startOfDay = (ms) => {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+};
+
+/** History rows come compressed ({s, a, lu}) from the WebSocket API; this reads either form. */
+const row = (r) => ({ state: r.s ?? r.state, attributes: r.a ?? r.attributes ?? {}, at: r.lu != null ? r.lu * 1000 : Date.parse(r.last_updated) });
+
+/** Every trip in the Last trip distance sensor's history, once each (keyed by its start). */
+function parseTrips(rows) {
+  const trips = new Map();
+  for (const r of rows.map(row)) {
+    const a = r.attributes;
+    const distance = num(r.state);
+    if (!a.started || distance == null) continue;
+    trips.set(a.started, {
+      end: Date.parse(a.ended ?? "") || r.at, distance, energy: num(a.energy_used_kwh), minutes: num(a.duration_min),
+    });
+  }
+  return [...trips.values()];
+}
+
+/** Every charging session in the Charge session sensor's history, at its final value. */
+function parseCharges(rows) {
+  const charges = new Map();
+  for (const r of rows.map(row)) {
+    const a = r.attributes;
+    const kwh = num(r.state);
+    if (!a.started || kwh == null) continue;
+    charges.set(a.started, { end: Date.parse(a.ended ?? "") || r.at, kwh });
+  }
+  return [...charges.values()].filter((c) => c.kwh >= 0.05);
+}
 
 /** The Car Bridge key an entity ID ends with, longest first (usable_battery_capacity before battery_capacity). */
 function keyOf(objectId) {
@@ -155,6 +210,27 @@ const STYLES = `
     font-size: 12px; font-weight: 500; color: var(--primary-text-color); background: var(--cb-surface); white-space: nowrap;
   }
   .chip ha-icon { --mdc-icon-size: 16px; color: var(--chip-color, var(--secondary-text-color)); }
+  .detail { font-size: 12px; color: var(--secondary-text-color); margin-top: 8px; }
+  .period { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--cb-surface); }
+  .period button {
+    all: unset; cursor: pointer; padding: 3px 9px; border-radius: 7px;
+    font-size: 11px; font-weight: 600; color: var(--secondary-text-color);
+  }
+  .period button[aria-pressed="true"] {
+    background: var(--ha-card-background, var(--card-background-color, #fff)); color: var(--primary-text-color);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
+  }
+  .period button:focus-visible { outline: 2px solid var(--primary-color); }
+  .delta { font-size: 11px; font-weight: 600; margin-left: 4px; color: var(--secondary-text-color); }
+  .delta.good { color: var(--success-color, #43a047); }
+  .delta.bad { color: var(--warning-color, #ffa600); }
+  .bars { display: flex; align-items: flex-end; gap: 6px; height: 66px; margin-top: 14px; }
+  .bars.month { gap: 2px; height: 54px; }
+  .bars .col { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 4px; }
+  .bars .b { width: 100%; max-width: 30px; min-height: 3px; border-radius: 4px 4px 2px 2px; background: color-mix(in srgb, var(--primary-color) 55%, transparent); }
+  .bars .b.none { background: var(--cb-track); }
+  .bars .b.today { background: var(--primary-color); }
+  .bars .col span { font-size: 10px; line-height: 1; color: var(--secondary-text-color); }
   [data-entity] { cursor: pointer; }
   [data-entity]:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; border-radius: 8px; }
   .tile[data-entity]:hover, .chip[data-entity]:hover { background: color-mix(in srgb, var(--primary-text-color) 9%, transparent); }
@@ -162,7 +238,7 @@ const STYLES = `
     .tiles, .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .tile:last-child:nth-child(odd) { grid-column: 1 / -1; }
     .big { font-size: 36px; }
-    .pill .detail { display: none; }
+    .pill-detail { display: none; }
   }
   @media (prefers-reduced-motion: reduce) {
     .fill { transition: none; }
@@ -189,8 +265,10 @@ class CarBridgeCard extends HTMLElement {
 
   setConfig(config) {
     if (!config?.entity) throw new Error("Choose one of the car's entities, such as its battery level");
-    this._config = { show_trip: true, show_tires: true, show_chips: true, ...config };
+    this._config = { ...DEFAULTS, ...config };
+    this._period = this._config.stats_period === "month" ? "month" : "week";
     this._found = null;
+    this._history = null;
     this._signature = null;
     this._render();
   }
@@ -213,7 +291,7 @@ class CarBridgeCard extends HTMLElement {
   }
 
   getCardSize() {
-    return 7;
+    return 10;
   }
 
   getGridOptions() {
@@ -298,6 +376,18 @@ class CarBridgeCard extends HTMLElement {
     return `${this._fmt(kwh, Math.abs(kwh) < 10 ? 2 : 1)} kWh`;
   }
 
+  _money(amount) {
+    return new Intl.NumberFormat(this._lang, { style: "currency", currency: this._hass.config?.currency || "USD" }).format(amount);
+  }
+
+  /** What energy put into the battery cost at the wall: the charger loses some (10% by default). */
+  _cost(kwh) {
+    const id = this._config.price_entity;
+    const price = num(id ? this._hass.states[id]?.state : this._config.price);
+    if (price == null || price <= 0 || kwh == null) return null;
+    return (kwh / (num(this._config.charge_efficiency) || DEFAULTS.charge_efficiency)) * price;
+  }
+
   // State of the car
 
   _status() {
@@ -354,7 +444,13 @@ class CarBridgeCard extends HTMLElement {
     if (!this._config || !this._hass) return;
     if (!this.shadowRoot) {
       this.attachShadow({ mode: "open" });
-      this.shadowRoot.addEventListener("click", (e) => this._open(e));
+      this.shadowRoot.addEventListener("click", (e) => {
+        const period = e.composedPath().find((n) => n.dataset?.period);
+        if (!period) return this._open(e);
+        this._period = period.dataset.period;
+        this._signature = null;
+        this._render();
+      });
       this.shadowRoot.addEventListener("keydown", (e) => {
         if (e.key === "Enter" || e.key === " ") this._open(e);
       });
@@ -363,9 +459,12 @@ class CarBridgeCard extends HTMLElement {
       this._found = { registry: this._hass.entities, ...findEntities(this._hass, this._config.entity) };
       this._ids = this._found.ids;
     }
-    // Re-render only when one of the car's entities (or the config) changed.
-    const watched = Object.values(this._ids).map((id) => this._hass.states[id]?.last_updated);
-    const signature = JSON.stringify([watched, this._config, this._hass.themes?.darkMode, this._hass.locale]);
+    this._fetchHistory();
+    // Re-render only when one of the car's entities, the price, the history or the config changed.
+    const watched = [...Object.values(this._ids), this._config.price_entity].map((id) => this._hass.states[id]?.last_updated);
+    const signature = JSON.stringify([
+      watched, this._config, this._period, this._history?.at, this._hass.themes?.darkMode, this._hass.locale,
+    ]);
     if (signature === this._signature) return;
     this._signature = signature;
 
@@ -380,10 +479,48 @@ class CarBridgeCard extends HTMLElement {
         ${this._header(status)}
         ${this._hero(status)}
         ${this._tiles(status)}
+        ${this._config.show_stats ? this._summary() : ""}
+        ${this._config.show_charge ? this._lastCharge(status) : ""}
         ${this._config.show_trip ? this._trip() : ""}
         ${this._config.show_tires ? this._tires() : ""}
         ${this._config.show_chips ? this._chips(status) : ""}
       </ha-card>`;
+  }
+
+  /** Loads the trips and charges of the last [HISTORY_DAYS] for the summary, when they may have changed. */
+  _fetchHistory() {
+    if (!this._config.show_stats || !this._hass.callWS || this._fetching) return;
+    const ids = [this._ids.last_trip_distance, this._ids.charge_session].filter(Boolean);
+    if (!ids.length) return;
+    const key = ids.map((id) => this._hass.states[id]?.last_changed).join("|");
+    if (this._history && this._history.key === key && Date.now() - this._history.at < HISTORY_TTL_MS) return;
+    this._fetching = true;
+    const end = Date.now();
+    this._hass.callWS({
+      type: "history/history_during_period",
+      start_time: new Date(end - HISTORY_DAYS * DAY_MS).toISOString(),
+      end_time: new Date(end).toISOString(),
+      entity_ids: ids,
+      minimal_response: false,
+      no_attributes: false,
+      significant_changes_only: false,
+    }).then(
+      (result) => {
+        this._history = {
+          at: Date.now(), key,
+          trips: parseTrips(result[this._ids.last_trip_distance] ?? []),
+          charges: parseCharges(result[this._ids.charge_session] ?? []),
+        };
+      },
+      // No history (recorder off, say): the summary stays hidden until the next try.
+      () => {
+        this._history = { at: Date.now(), key, trips: [], charges: [] };
+      },
+    ).finally(() => {
+      this._fetching = false;
+      this._signature = null;
+      this._render();
+    });
   }
 
   _open(e) {
@@ -409,7 +546,7 @@ class CarBridgeCard extends HTMLElement {
     if (Number.isFinite(lastUpdate)) parts.push(`${status.label === "Asleep" ? "Last seen" : "Updated"} ${this._ago(lastUpdate)}`);
     const subtitle = parts.filter(Boolean).join(" · ");
     // Narrow cards drop the detail; the tiles below repeat it.
-    const pill = `${esc(status.label)}${status.detail ? `<span class="detail"> · ${esc(status.detail)}</span>` : ""}`;
+    const pill = `${esc(status.label)}${status.detail ? `<span class="pill-detail"> · ${esc(status.detail)}</span>` : ""}`;
     return `
       <div class="header" ${this._ids.tracker ? `data-entity="${esc(this._ids.tracker)}" tabindex="0" role="button"` : ""}>
         <div class="avatar"><ha-icon icon="${this._hasBattery() ? "mdi:car-electric" : "mdi:car"}"></ha-icon></div>
@@ -510,6 +647,15 @@ class CarBridgeCard extends HTMLElement {
     }
     add("outside_temperature", "mdi:thermometer", "Outside", this._display("outside_temperature"));
     add("battery_temperature", "mdi:thermometer-lines", "Battery", this._display("battery_temperature"));
+    if (!status.charging && !status.driving) {
+      // Shown as a daily rate once parked long enough for one (Car Bridge 0.2.2 and later).
+      const lost = this._num("parked_loss");
+      const perDay = num(this._state("parked_loss")?.attributes.per_day_kwh);
+      if (lost != null) {
+        add("parked_loss", "mdi:battery-minus-outline", perDay != null ? "Parked loss/day" : "Parked loss",
+          this._energy(perDay ?? lost));
+      }
+    }
     add("odometer", "mdi:counter", "Odometer", this._num("odometer") != null ? `${this._fmt(this._num("odometer"))} ${this._unit("odometer")}` : null);
     add("energy_charged", "mdi:battery-plus", "Total charged", this._num("energy_charged") > 0 ? this._energy(this._num("energy_charged")) : null);
     add("usable_battery_capacity", "mdi:car-battery", "Usable capacity", this._display("usable_battery_capacity"));
@@ -526,6 +672,133 @@ class CarBridgeCard extends HTMLElement {
       </div>`;
   }
 
+  /** Trips and charges that ended in the [days] up to [daysAgo] days ago. */
+  _periodStats(days, daysAgo) {
+    const end = Date.now() - daysAgo * DAY_MS;
+    const start = end - days * DAY_MS;
+    const trips = this._history.trips.filter((t) => t.end > start && t.end <= end);
+    const charges = this._history.charges.filter((c) => c.end > start && c.end <= end);
+    // Efficiency only from trips with a measured energy, so a trip without one doesn't inflate it.
+    const measured = trips.filter((t) => t.energy > 0.05);
+    const used = sum(measured.map((t) => t.energy));
+    return {
+      trips, charges, used,
+      distance: sum(trips.map((t) => t.distance)),
+      efficiency: used >= 0.3 ? sum(measured.map((t) => t.distance)) / used : null,
+      charged: sum(charges.map((c) => c.kwh)),
+      minutes: sum(trips.map((t) => t.minutes)),
+    };
+  }
+
+  /** The last 7 or 30 days: distance, efficiency, energy used and charged, against the period before. */
+  _summary() {
+    const history = this._history;
+    if (!history || (!history.trips.length && !history.charges.length)) return "";
+    const days = this._period === "month" ? 30 : 7;
+    const now = this._periodStats(days, 0);
+    const before = this._periodStats(days, days);
+    const distanceUnit = this._unit("last_trip_distance");
+    const efficiencyUnit = this._unit("last_trip_efficiency") || `${distanceUnit}/kWh`;
+    // Change against the period before, when there was one to compare with.
+    const change = (value, previous, higherIsBetter) => {
+      if (value == null || !previous) return "";
+      const percent = Math.round(((value - previous) / previous) * 100);
+      if (!percent) return "";
+      const tone = higherIsBetter == null ? "" : (percent > 0) === higherIsBetter ? " good" : " bad";
+      return `<span class="delta${tone}">${percent > 0 ? "▲" : "▼"} ${Math.abs(percent)}%</span>`;
+    };
+    const cost = this._cost(now.charged);
+    const stats = [
+      [`${this._fmt(now.distance, now.distance < 100 ? 1 : 0)} ${distanceUnit}`, change(now.distance, before.distance), "Distance", "last_trip_distance"],
+      [now.efficiency != null ? `${this._fmt(now.efficiency, 1)} ${efficiencyUnit}` : "—", change(now.efficiency, before.efficiency, true), "Efficiency", "last_trip_efficiency"],
+      [this._energy(now.used), change(now.used, before.used), "Energy used", "last_trip_distance"],
+      cost != null
+        ? [this._money(cost), "", `Charging · ${this._energy(now.charged)}`, "charge_session"]
+        : [this._energy(now.charged), "", "Charged", "charge_session"],
+    ];
+    const counts = [
+      `${now.trips.length} ${now.trips.length === 1 ? "trip" : "trips"}`,
+      now.minutes ? `${this._duration(now.minutes)} driving` : null,
+      `${now.charges.length} ${now.charges.length === 1 ? "charge" : "charges"}`,
+    ].filter(Boolean);
+    return `
+      <div class="section">
+        <div class="section-head">
+          ${days === 7 ? "Last 7 days" : "Last 30 days"}
+          <div class="period" role="group" aria-label="Period">
+            <button data-period="week" aria-pressed="${days === 7}">7 days</button>
+            <button data-period="month" aria-pressed="${days === 30}">30 days</button>
+          </div>
+        </div>
+        <div class="stats">
+          ${stats.map(([value, delta, label, key]) => `
+            <div ${this._attrs(key)}><div class="value">${esc(value)}${delta}</div><div class="label">${esc(label)}</div></div>`).join("")}
+        </div>
+        ${this._bars(days, now.trips)}
+        <div class="detail">${esc(counts.join(" · "))}</div>
+      </div>`;
+  }
+
+  /** Distance per day, today on the right. */
+  _bars(days, trips) {
+    const today = startOfDay(Date.now());
+    const totals = new Array(days).fill(0);
+    for (const t of trips) {
+      const index = days - 1 - Math.round((today - startOfDay(t.end)) / DAY_MS);
+      if (index >= 0 && index < days) totals[index] += t.distance;
+    }
+    const most = Math.max(...totals);
+    const tall = days === 7 ? 48 : 50;
+    const unit = this._unit("last_trip_distance");
+    const columns = totals.map((total, i) => {
+      const day = new Date(today - (days - 1 - i) * DAY_MS);
+      const label = day.toLocaleDateString(this._lang, { weekday: "narrow" });
+      const height = most > 0 ? Math.max(3, (total / most) * tall) : 3;
+      const kind = i === days - 1 ? " today" : total ? "" : " none";
+      const title = `${day.toLocaleDateString(this._lang, { weekday: "short", month: "short", day: "numeric" })}: ${this._fmt(total, 1)} ${unit}`;
+      return `<div class="col" title="${esc(title)}"><div class="b${kind}" style="height: ${height}px"></div>${days === 7 ? `<span>${esc(label)}</span>` : ""}</div>`;
+    });
+    return `<div class="bars${days === 7 ? "" : " month"}">${columns.join("")}</div>`;
+  }
+
+  /** The last finished charge: what it added, from and to which level, range gained, power and cost. */
+  _lastCharge(status) {
+    if (status.charging) return "";
+    const session = this._state("charge_session");
+    const kwh = this._num("charge_session");
+    if (!session || kwh == null || kwh < 0.05 || session.attributes.in_progress) return "";
+    const a = session.attributes;
+    const ended = Date.parse(a.ended ?? "");
+    const cost = this._cost(kwh);
+    const level = a.start_level != null && a.end_level != null
+      ? [`${this._fmt(a.start_level)} → ${this._fmt(a.end_level)}%`, "Battery"]
+      : a.end_level != null ? [`${this._fmt(a.end_level)}%`, "Charged to"] : null;
+    const stats = [
+      [`+${this._energy(kwh)}`, "Added", "charge_session"],
+      level && [...level, "battery_level"],
+      a.range_gained != null ? [`+${this._fmt(a.range_gained)} ${this._unit("range")}`, "Range added", "range"] : null,
+      cost != null
+        ? [this._money(cost), "Cost", "charge_session"]
+        : a.duration_min != null ? [this._duration(a.duration_min), "Time", "charge_session"] : null,
+    ].filter(Boolean);
+    const details = [
+      a.average_power_kw != null ? `Average ${this._fmt(a.average_power_kw, 1)} kW` : null,
+      a.peak_power_kw != null ? `peak ${this._fmt(a.peak_power_kw, 1)} kW` : null,
+      cost != null && a.duration_min != null ? this._duration(a.duration_min) : null,
+      a.while_asleep ? "while the car slept" : null,
+    ].filter(Boolean);
+    const when = Number.isFinite(ended) ? `${this._day(new Date(ended))}, ${this._time(new Date(ended))}` : "";
+    return `
+      <div class="section">
+        <div class="section-head">Last charge<span>${esc(when)}</span></div>
+        <div class="stats">
+          ${stats.map(([value, label, key]) => `
+            <div ${this._attrs(key)}><div class="value">${esc(value)}</div><div class="label">${esc(label)}</div></div>`).join("")}
+        </div>
+        ${details.length ? `<div class="detail">${esc(details.join(" · "))}</div>` : ""}
+      </div>`;
+  }
+
   _trip() {
     const distance = this._num("last_trip_distance");
     if (distance == null) return "";
@@ -539,6 +812,14 @@ class CarBridgeCard extends HTMLElement {
       [a.energy_used_kwh != null ? this._energy(a.energy_used_kwh) : a.average_speed != null ? `${this._fmt(a.average_speed)}` : null,
         a.energy_used_kwh != null ? "Energy used" : "Average speed", "last_trip_distance"],
     ].filter(([value]) => value != null);
+    const speed = this._unit("speed") || "";
+    const cost = a.energy_used_kwh > 0 ? this._cost(a.energy_used_kwh) : null;
+    const details = [
+      a.average_speed != null && a.energy_used_kwh != null ? `Average ${this._fmt(a.average_speed)} ${speed}`.trim() : null,
+      a.max_speed != null ? `top ${this._fmt(a.max_speed)} ${speed}`.trim() : null,
+      a.outside_temperature != null ? `${this._fmt(a.outside_temperature)} ${this._unit("outside_temperature")}`.trim() : null,
+      cost != null ? `about ${this._money(cost)}` : null,
+    ].filter(Boolean);
     const when = Number.isFinite(ended) ? `${this._day(new Date(ended))}, ${this._time(new Date(ended))}` : "";
     return `
       <div class="section">
@@ -547,6 +828,7 @@ class CarBridgeCard extends HTMLElement {
           ${stats.map(([value, label, key]) => `
             <div ${this._attrs(key)}><div class="value">${esc(value)}</div><div class="label">${esc(label)}</div></div>`).join("")}
         </div>
+        ${details.length ? `<div class="detail">${esc(details.join(" · "))}</div>` : ""}
       </div>`;
   }
 
@@ -613,19 +895,40 @@ const SCHEMA = [
     type: "grid",
     name: "",
     schema: [
+      { name: "show_stats", selector: { boolean: {} } },
+      { name: "show_charge", selector: { boolean: {} } },
       { name: "show_trip", selector: { boolean: {} } },
       { name: "show_tires", selector: { boolean: {} } },
       { name: "show_chips", selector: { boolean: {} } },
     ],
   },
+  {
+    name: "stats_period",
+    selector: { select: { mode: "dropdown", options: [{ value: "week", label: "7 days" }, { value: "month", label: "30 days" }] } },
+  },
+  {
+    type: "grid",
+    name: "",
+    schema: [
+      { name: "price", selector: { number: { min: 0, step: 0.001, mode: "box" } } },
+      { name: "price_entity", selector: { entity: { filter: [{ domain: ["sensor", "input_number"] }] } } },
+    ],
+  },
+  { name: "charge_efficiency", selector: { number: { min: 0.5, max: 1, step: 0.01, mode: "box" } } },
 ];
 
 const LABELS = {
   entity: "Car (any of its sensors, such as the battery level)",
   name: "Name (optional)",
+  show_stats: "7 and 30 day summary",
+  show_charge: "Last charge",
   show_trip: "Last trip",
   show_tires: "Tire pressures",
   show_chips: "Status chips",
+  stats_period: "Summary shows first",
+  price: "Electricity price per kWh (optional)",
+  price_entity: "…or a price sensor",
+  charge_efficiency: "Charger efficiency (0.9 = 90% reaches the battery)",
 };
 
 class CarBridgeCardEditor extends HTMLElement {
@@ -650,7 +953,7 @@ class CarBridgeCardEditor extends HTMLElement {
       this.appendChild(this._form);
     }
     this._form.hass = this._hass;
-    this._form.data = { show_trip: true, show_tires: true, show_chips: true, ...this._config };
+    this._form.data = { ...DEFAULTS, ...this._config };
     this._form.schema = SCHEMA;
   }
 }
@@ -663,7 +966,7 @@ if (!customElements.get("car-bridge-card")) {
   window.customCards.push({
     type: "car-bridge-card",
     name: "Car Bridge",
-    description: "Battery, range, charging, trips and tires for a car that Car Bridge sends to Home Assistant.",
+    description: "Battery, range, charging, 7 and 30 day summaries, the last charge and trip, and tires for a car that Car Bridge sends to Home Assistant.",
     preview: true,
   });
   console.info(`%c CAR-BRIDGE-CARD %c ${VERSION} `, "color: white; background: #039be5; font-weight: 700", "color: #039be5; background: white");
